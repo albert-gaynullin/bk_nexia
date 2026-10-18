@@ -4,7 +4,7 @@
 #include <WiFi.h>
 #include "ELMduino.h"
 #include "RTClib.h"
-#include <NimBLEDevice.h>
+#include "DevicePortal.h"
 #include <memory>
 #include <new>
 #include <freertos/FreeRTOS.h>
@@ -13,6 +13,9 @@
 
 std::unique_ptr<ELM327> myELM327;
 RTC_PCF8563 rtc;
+DevicePortal portal(rtc);
+bool rtcReady = false;
+bool serviceMode = false;
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
 const char* ssid = "WiFi_OBDII";
@@ -21,10 +24,6 @@ const char* ssid = "WiFi_OBDII";
 #define SERVICE_UUID "12345678-1234-1234-1234-1234567890ab"
 #define CHARACTERISTIC_UUID "abcdefab-1234-5678-1234-abcdefabcdef"
 
-struct TimeMessage {
-    char value[20];
-};
-QueueHandle_t timeQueue;
 QueueHandle_t elmInitQueue;
 
 #define DEBUG_PORT Serial
@@ -195,20 +194,18 @@ void init_elm()
 }
 
 
-void init_rtc()
+bool init_rtc()
 {
     if (!rtc.begin()) {
-        Serial.flush();
-
-        while (1) {
-            delay(10);
-        }
+        Serial.println("PCF8563 unavailable");
+        return false;
     }
 
     if (rtc.lostPower()) {
         rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
         rtc.start();
     }
+    return true;
 }
 
 
@@ -220,7 +217,7 @@ void draw_stat()
         display.setTextSize(1);
         display.setCursor(0, 20);
         display.println(elm_state == ELM_RETRY ? "ELM unavailable" : "Connecting to ELM...");
-        display.println("Clock and BLE active");
+        display.println("Clock active");
         display.display();
         return;
     }
@@ -254,6 +251,15 @@ void draw_stat()
 
 void draw_date_time()
 {
+    if (!rtcReady) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(0, 20);
+        display.println("RTC unavailable");
+        display.println("Check PCF8563 wiring");
+        display.display();
+        return;
+    }
     DateTime now = rtc.now();
 
     display.clearDisplay();
@@ -408,76 +414,63 @@ void changeMod()
 }
 
 
-class TimeCallback : public NimBLECharacteristicCallbacks
+void draw_portal()
 {
-    void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo &) override
-    {
-        auto value = pChar->getValue();
-        if (value.length() == 19) {
-            for (size_t i = 0; i < 19; ++i) {
-                const char expected = (i == 4 || i == 7) ? '-' :
-                                      (i == 10) ? ' ' :
-                                      (i == 13 || i == 16) ? ':' : '\0';
-                if (expected ? value[i] != expected : (value[i] < '0' || value[i] > '9')) {
-                    return;
-                }
-            }
-            TimeMessage message = {};
-            memcpy(message.value, value.c_str(), 19);
-            xQueueOverwrite(timeQueue, &message);
-        }
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.println("NEXIA SETUP / OTA");
+    display.println(portal.ssid());
+    display.print("Pass: ");
+    display.println(portal.password());
+    display.println("User: admin");
+    display.println("http://192.168.4.1");
+    display.setCursor(0, 52);
+    display.print(portal.status());
+    if (strcmp(portal.status(), "UPLOADING") == 0) {
+        display.print(" ");
+        display.print(portal.progress());
+        display.print("%");
     }
-};
-
-static TimeCallback timeCallback;
+    display.display();
+}
 
 
 void setup()
 {
     DEBUG_PORT.begin(115200);
-
-    init_display();
-    init_rtc();
-
     pinMode(pushButton_pin, INPUT_PULLUP);
+    const uint32_t bootStarted = millis();
+    init_display();
+    // Physical activation at boot keeps the portal and ELM worker mutually exclusive.
+    while (digitalRead(pushButton_pin) == LOW && millis() - bootStarted < 3000) {
+        delay(5);
+    }
+    serviceMode = digitalRead(pushButton_pin) == LOW;
+    rtcReady = init_rtc();
+    if (serviceMode) {
+        portal.begin(rtcReady, draw_portal);
+        draw_portal();
+        return;
+    }
 
-    timeQueue = xQueueCreate(1, sizeof(TimeMessage));
     elmInitQueue = xQueueCreate(1, sizeof(bool));
-    if (!timeQueue || !elmInitQueue) {
+    if (!elmInitQueue) {
         Serial.println("Queue allocation failed");
         ESP.restart();
         return;
     }
-
-    NimBLEDevice::init("NexiaBLE"); // имя, которое увидит iPhone
-
-    NimBLEServer *pServer = NimBLEDevice::createServer();
-    pServer->advertiseOnDisconnect(true);
-
-    NimBLEService *pService = pServer->createService(SERVICE_UUID);
-
-    NimBLECharacteristic *pCharacteristic = pService->createCharacteristic(
-        CHARACTERISTIC_UUID,
-        NIMBLE_PROPERTY::WRITE,
-        sizeof(TimeMessage::value) - 1
-    );
-
-    pCharacteristic->setCallbacks(&timeCallback);
-
-    pService->start();
-
-    NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
-
-    pAdvertising->setName("NexiaBLE");
-    pAdvertising->addServiceUUID(SERVICE_UUID);
-    pAdvertising->enableScanResponse(true);
-
-    NimBLEDevice::startAdvertising();
 }
 
 
 void loop()
 {
+    if (serviceMode) {
+        portal.loop();
+        delay(1);
+        return;
+    }
     changeMod();
     init_elm();
     if (elm_state == ELM_READY) {
@@ -485,31 +478,6 @@ void loop()
         update_stats();
     }
 
-    TimeMessage message;
-    if (xQueueReceive(timeQueue, &message, 0) == pdTRUE) {
-        // Ожидаем строку вида: "2025-08-21 22:15:00"
-        int year, month, day, hour, minute, second;
-
-        if (sscanf(
-            message.value,
-            "%4d-%2d-%2d %2d:%2d:%2d",
-            &year,
-            &month,
-            &day,
-            &hour,
-            &minute,
-            &second
-        ) == 6 && year >= 2000 && year <= 2099 &&
-            month >= 1 && month <= 12 && day >= 1 && day <= 31 &&
-            hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 &&
-            second >= 0 && second <= 59) {
-            DateTime newTime(year, month, day, hour, minute, second);
-            if (newTime.isValid()) {
-                rtc.adjust(newTime);
-                displayDirty = true;
-            }
-        }
-    }
     const uint32_t now = millis();
     const uint32_t displayInterval = mode == 0 ? 1000 : 250;
     if (displayDirty || now - lastDisplayUpdate >= displayInterval) {
